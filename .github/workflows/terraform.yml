@@ -1,0 +1,103 @@
+name: vprofile IaC
+
+on:
+  push:
+    branches: [main, stage]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [main, stage]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: ${{ github.ref_name == 'stage' && 'vprofile-eks-stage' || 'vprofile-eks' }}
+
+jobs:
+  validate:
+    name: Terraform checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.3'
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without remote state
+        run: terraform init -backend=false -input=false
+
+      - name: Validate configuration
+        run: terraform validate
+
+  deploy:
+    name: Terraform plan and apply
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vprofile-terraform-${{ github.ref_name }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./terraform
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      BUCKET_TF_STATE: ${{ secrets.BUCKET_TF_STATE }}
+      TF_STATE_KEY: vprofile/${{ github.ref_name }}/terraform.tfstate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.3'
+
+      - name: Initialize S3 backend
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$BUCKET_TF_STATE" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION"
+
+      - name: Create Terraform plan
+        run: |
+          terraform plan -input=false -out=tfplan \
+            -var="region=$AWS_REGION" \
+            -var="clusterName=$EKS_CLUSTER_NAME"
+
+      - name: Apply saved plan
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -input=false tfplan
+
+      - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get kubeconfig file
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Install ingress controller
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.9.1/deploy/static/provider/aws/deploy.yaml
